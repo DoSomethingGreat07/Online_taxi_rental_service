@@ -38,30 +38,22 @@ def login_manager():
         cur.execute("SELECT * FROM Manager WHERE ssn = %s", (data['ssn'],))
         manager = cur.fetchone()
         if manager:
-            return jsonify({'message': 'Manager login successful'})
+            manager_name = manager[1]  # assuming index 1 is name
+            ssn = manager[0]           # assuming index 0 is SSN
+            return jsonify({
+                'success': True,
+                'message': 'Manager login successful',
+                'name': manager_name,
+                'ssn': ssn
+            })
         else:
-            return jsonify({'error': 'Invalid SSN'}), 404
+            return jsonify({'success': False, 'error': 'Invalid SSN'}), 404
     except Exception as e:
-        return jsonify({'error': str(e)}), 400
+        return jsonify({'success': False, 'error': str(e)}), 400
     finally:
         cur.close()
         conn.close()
 
-@app.route('/manager/insert_car', methods=['POST'])
-def insert_car():
-    data = request.get_json()
-    conn = get_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute("INSERT INTO Car (brand) VALUES (%s)", (data['brand'],))
-        conn.commit()
-        return jsonify({'message': 'Car inserted'})
-    except Exception as e:
-        conn.rollback()
-        return jsonify({'error': str(e)}), 400
-    finally:
-        cur.close()
-        conn.close()
 
 @app.route('/manager/remove_car', methods=['POST'])
 def remove_car():
@@ -247,19 +239,44 @@ def insert_driver():
     nameofroad = data.get('nameofroad')
     number = data.get('number')
     city = data.get('city')
-    
+
+    # Validate all required fields
+    if not all([name, nameofroad, number, city]):
+        return jsonify({"error": "All fields are required"}), 400
+
     conn = get_connection()
     cur = conn.cursor()
     try:
+        conn.autocommit = False  # Start transaction
+
+        # 1. Insert address if not exists
+        cur.execute("""
+            INSERT INTO Address (nameofroad, number, city)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (nameofroad, number, city) DO NOTHING
+            RETURNING *
+        """, (nameofroad, number, city))
+
+        # 2. Insert driver (which references the address)
         cur.execute("""
             INSERT INTO Driver (name, nameofroad, number, city)
             VALUES (%s, %s, %s, %s)
         """, (name, nameofroad, number, city))
+
         conn.commit()
-        return jsonify({"message": "Driver inserted successfully"})
+
+        return jsonify({
+            "message": "Driver inserted successfully",
+            "address_action": "Created new address" if cur.rowcount > 0 else "Used existing address"
+        })
+
     except Exception as e:
         conn.rollback()
-        return jsonify({"error": str(e)}), 400
+        return jsonify({
+            "error": "Failed to insert driver",
+            "details": str(e),
+            "solution": "Check if driver already exists or address is valid"
+        }), 400
     finally:
         cur.close()
         conn.close()
@@ -271,104 +288,163 @@ def delete_driver():
     data = request.get_json()
     name = data.get('name')
     
-    conn = get_connection()
-    cur = conn.cursor()
+    # Validate input
+    if not name or not isinstance(name, str):
+        return jsonify({"error": "Valid driver name is required"}), 400
+    
+    conn = None
+    cur = None
     try:
-        cur.execute("DELETE FROM Driver WHERE name = %s", (name,))
+        conn = get_connection()
+        if not conn:
+            raise Exception("Database connection failed")
+            
+        cur = conn.cursor()
+        
+        # Start transaction
+        conn.autocommit = False
+        
+        # Verify driver exists WITHIN the same transaction
+        cur.execute("SELECT 1 FROM Driver WHERE name = %s FOR UPDATE", (name.strip(),))
+        if not cur.fetchone():
+            conn.rollback()
+            return jsonify({"error": "Driver not found"}), 404
+        
+        # Check for active rentals
+        cur.execute("""
+            SELECT rent_id FROM Rent 
+            WHERE name = %s AND rent_date >= CURRENT_DATE
+            LIMIT 1
+        """, (name.strip(),))
+        if cur.fetchone():
+            conn.rollback()
+            return jsonify({
+                "error": "Driver has active rentals",
+                "solution": "Cancel rentals first"
+            }), 400
+        
+        # Delete related records
+        cur.execute("DELETE FROM Review WHERE name = %s", (name.strip(),))
+        reviews_deleted = cur.rowcount
+        
+        cur.execute("DELETE FROM Driver_Model WHERE name = %s", (name.strip(),))
+        models_unlinked = cur.rowcount
+        
+        cur.execute("DELETE FROM Rent WHERE name = %s", (name.strip(),))
+        rentals_deleted = cur.rowcount
+        
+        # Delete driver
+        cur.execute("DELETE FROM Driver WHERE name = %s", (name.strip(),))
+        if cur.rowcount != 1:
+            conn.rollback()
+            return jsonify({
+                "error": "Driver deletion failed",
+                "details": {
+                    "expected": 1,
+                    "actual": cur.rowcount,
+                    "possible_cause": "Driver was modified by another process"
+                }
+            }), 400
+        
         conn.commit()
-        return jsonify({"message": "Driver deleted successfully"})
+        
+        return jsonify({
+            "message": "Driver deleted successfully",
+            "stats": {
+                "reviews_deleted": reviews_deleted,
+                "models_unlinked": models_unlinked,
+                "rentals_canceled": rentals_deleted
+            }
+        })
+        
     except Exception as e:
-        conn.rollback()
-        return jsonify({"error": str(e)}), 400
+        if conn: conn.rollback()
+        return jsonify({
+            "error": "Operation failed",
+            "details": str(e),
+            "solution": "Check database consistency"
+        }), 500
+        
     finally:
-        cur.close()
-        conn.close()
+        if cur: cur.close()
+        if conn: conn.close()
 
-
-
-
-@app.route('/manager/top_k_clients', methods=['POST'])
+@app.route('/manager/top_k_clients', methods=['GET'])
 def top_k_clients():
-    data = request.get_json()
+    k = request.args.get('k', type=int)
     conn = get_connection()
     cur = conn.cursor()
-    try:
-        cur.execute("""
-            SELECT Client.name, Client.email_address
-            FROM Client
-            JOIN Rent ON Client.email_address = Rent.client_email
-            GROUP BY Client.email_address
-            ORDER BY COUNT(Rent.rent_id) DESC
-            LIMIT %s
-        """, (data['k'],))
-        clients = cur.fetchall()
-        return jsonify(clients)
-    except Exception as e:
-        return jsonify({'error': str(e)}), 400
-    finally:
-        cur.close()
-        conn.close()
+    cur.execute("""
+        SELECT c.name, c.email_address, COUNT(r.rent_id) AS rent_count
+        FROM Client c
+        JOIN Rent r ON c.email_address = r.client_email
+        GROUP BY c.name, c.email_address
+        ORDER BY rent_count DESC
+        LIMIT %s
+    """, (k,))
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    results = [{'name': row[0], 'email': row[1], 'rent_count': row[2]} for row in rows]
+    return jsonify(results), 200
 
-@app.route('/manager/cars_rent_count', methods=['GET'])
-def cars_rent_count():
+@app.route('/manager/model_usage', methods=['GET'])
+def model_usage():
     conn = get_connection()
     cur = conn.cursor()
-    try:
-        cur.execute("""
-            SELECT Model.model_id, COUNT(Rent.rent_id)
-            FROM Model
-            LEFT JOIN Rent ON Model.model_id = Rent.model_id
-            GROUP BY Model.model_id
-        """)
-        models = cur.fetchall()
-        return jsonify(models)
-    except Exception as e:
-        return jsonify({'error': str(e)}), 400
-    finally:
-        cur.close()
-        conn.close()
+    cur.execute("""
+        SELECT m.model_id, m.color, m.construction_year, COUNT(r.rent_id) AS times_rented
+        FROM Model m
+        LEFT JOIN Rent r ON m.model_id = r.model_id
+        GROUP BY m.model_id, m.color, m.construction_year
+        ORDER BY times_rented DESC
+    """)
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    results = [{'model_id': row[0], 'color': row[1], 'year': row[2], 'times_rented': row[3]} for row in rows]
+    return jsonify(results), 200
 
 @app.route('/manager/driver_stats', methods=['GET'])
 def driver_stats():
     conn = get_connection()
     cur = conn.cursor()
-    try:
-        cur.execute("""
-            SELECT Driver.name, COUNT(Rent.rent_id), AVG(Review.rating)
-            FROM Driver
-            LEFT JOIN Rent ON Driver.name = Rent.name
-            LEFT JOIN Review ON Driver.name = Review.name
-            GROUP BY Driver.name
-        """)
-        stats = cur.fetchall()
-        return jsonify(stats)
-    except Exception as e:
-        return jsonify({'error': str(e)}), 400
-    finally:
-        cur.close()
-        conn.close()
+    cur.execute("""
+        SELECT d.name, COUNT(r.rent_id) AS total_rents, 
+               ROUND(AVG(rv.rating), 2) AS avg_rating
+        FROM Driver d
+        LEFT JOIN Rent r ON d.name = r.name
+        LEFT JOIN Review rv ON d.name = rv.name
+        GROUP BY d.name
+        ORDER BY total_rents DESC
+    """)
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    results = [{'name': row[0], 'total_rents': row[1], 'avg_rating': float(row[2]) if row[2] else None} for row in rows]
+    return jsonify(results), 200
 
-@app.route('/manager/clients_by_city', methods=['POST'])
+
+@app.route('/manager/clients_by_city', methods=['GET'])
 def clients_by_city():
-    data = request.get_json()
+    c1 = request.args.get('c1')
+    c2 = request.args.get('c2')
     conn = get_connection()
     cur = conn.cursor()
-    try:
-        cur.execute("""
-            SELECT DISTINCT Client.name, Client.email_address
-            FROM Client
-            JOIN Client_Address CA ON Client.email_address = CA.client_email
-            JOIN Rent ON Client.email_address = Rent.client_email
-            JOIN Driver ON Rent.name = Driver.name
-            WHERE CA.city = %s AND Driver.city = %s
-        """, (data['city1'], data['city2']))
-        clients = cur.fetchall()
-        return jsonify(clients)
-    except Exception as e:
-        return jsonify({'error': str(e)}), 400
-    finally:
-        cur.close()
-        conn.close()
+    cur.execute("""
+        SELECT DISTINCT cl.name, cl.email_address
+        FROM Client cl
+        JOIN Client_Address ca ON cl.email_address = ca.client_email
+        JOIN Rent r ON cl.email_address = r.client_email
+        JOIN Driver d ON r.name = d.name
+        WHERE ca.city = %s AND d.city = %s
+    """, (c1, c2))
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    result = [{'name': row[0], 'email': row[1]} for row in rows]
+    return jsonify(result), 200
+
 
 # -------------------- Driver APIs --------------------
 
@@ -452,36 +528,32 @@ def view_driver_models():
     try:
         cur.execute("""
             SELECT 
-                Car.car_id,
-                Model.model_id,
-                Car.brand,
-                Model.color,
-                Model.construction_year,
-                Model.transmission_type
-            FROM 
-                Car
-            INNER JOIN 
-                Model ON Car.car_id = Model.car_id
-            ORDER BY 
-                Car.car_id, Model.model_id
+                c.car_id,
+                m.model_id,
+                c.brand,
+                m.color,
+                m.construction_year,
+                m.transmission_type
+            FROM Model m
+            JOIN Car c ON m.car_id = c.car_id
+            ORDER BY c.car_id, m.model_id
         """)
-        models = cur.fetchall()
-        result = []
-        for row in models:
-            result.append({
-                "car_id": row[0],
-                "model_id": row[1],
-                "brand": row[2],
-                "color": row[3],
-                "construction_year": row[4],
-                "transmission_type": row[5]
-            })
+        rows = cur.fetchall()
+        result = [{
+            "car_id": r[0],
+            "model_id": r[1],
+            "brand": r[2],
+            "color": r[3],
+            "construction_year": r[4],
+            "transmission_type": r[5]
+        } for r in rows]
         return jsonify(result)
     except Exception as e:
         return jsonify({"error": str(e)}), 400
     finally:
         cur.close()
         conn.close()
+
 
 @app.route('/driver/declare_driver_model', methods=['POST'])
 def declare_driver_model():
@@ -534,31 +606,50 @@ def register_client():
 @app.route('/client/add_address', methods=['POST'])
 def add_client_address():
     data = request.get_json()
-    client_email = data.get('client_email')
-    nameofroad = data.get('nameofroad')
-    number = data.get('number')
-    city = data.get('city')
+    print("Received address data:", data)  # Debug logging
+    
+    if not data:
+        return jsonify({"error": "No data provided"}), 400
+        
+    required_fields = ['client_email', 'nameofroad', 'number', 'city']
+    for field in required_fields:
+        if field not in data or not data[field]:
+            return jsonify({"error": f"Missing required field: {field}"}), 400
 
     conn = get_connection()
     cur = conn.cursor()
     try:
-        # Address must exist first
-        cur.execute("""
-            SELECT * FROM Address WHERE nameofroad = %s AND number = %s AND city = %s
-        """, (nameofroad, number, city))
-        address = cur.fetchone()
-        if not address:
-            return jsonify({"error": "Address does not exist. Please insert address first."}), 400
+        conn.autocommit = False
         
+        # 1. Insert address if not exists
+        cur.execute("""
+            INSERT INTO Address (nameofroad, number, city)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (nameofroad, number, city) DO NOTHING
+        """, (data['nameofroad'], data['number'], data['city']))
+        
+        # 2. Link to client
         cur.execute("""
             INSERT INTO Client_Address (client_email, nameofroad, number, city)
             VALUES (%s, %s, %s, %s)
-        """, (client_email, nameofroad, number, city))
+            ON CONFLICT (client_email, nameofroad, number, city) DO NOTHING
+            RETURNING *
+        """, (data['client_email'], data['nameofroad'], data['number'], data['city']))
+        
         conn.commit()
-        return jsonify({"message": "Client address added successfully"})
+        
+        if cur.rowcount > 0:
+            return jsonify({"message": "Address linked successfully"})
+        else:
+            return jsonify({"message": "Address was already linked to client"})
+            
     except Exception as e:
         conn.rollback()
-        return jsonify({"error": str(e)}), 400
+        print("Error in add_address:", str(e))
+        return jsonify({
+            "error": "Failed to process address",
+            "details": str(e)
+        }), 400
     finally:
         cur.close()
         conn.close()
@@ -599,22 +690,29 @@ def add_credit_card():
 @app.route('/client/login', methods=['POST'])
 def client_login():
     data = request.get_json()
-    email_address = data.get('email_address')
+    email_address = data.get('email_address')  # match frontend key
 
     conn = get_connection()
     cur = conn.cursor()
     try:
         cur.execute("SELECT * FROM Client WHERE email_address = %s", (email_address,))
         client = cur.fetchone()
+
         if client:
-            return jsonify({'message': 'Client login successful'})
+            client_name = client[1]  # assuming column 1 is name
+            return jsonify({
+                'success': True,
+                'message': 'Client login successful',
+                'name': client_name
+            })
         else:
-            return jsonify({'error': 'Invalid client email'}), 404
+            return jsonify({'success': False, 'error': 'Invalid client email'}), 404
     except Exception as e:
-        return jsonify({'error': str(e)}), 400
+        return jsonify({'success': False, 'error': str(e)}), 400
     finally:
         cur.close()
         conn.close()
+
 
 
 

@@ -477,17 +477,21 @@ def update_driver_address():
     conn = get_connection()
     cur = conn.cursor()
     try:
-        # First check if the new Address exists
+        # Check if the address exists
         cur.execute("""
             SELECT * FROM Address
             WHERE nameofroad = %s AND number = %s AND city = %s
         """, (new_nameofroad, new_number, new_city))
         address_exists = cur.fetchone()
 
+        # If not, insert the new address
         if not address_exists:
-            return jsonify({"error": "Address does not exist. Please insert the address first."}), 400
+            cur.execute("""
+                INSERT INTO Address (nameofroad, number, city)
+                VALUES (%s, %s, %s)
+            """, (new_nameofroad, new_number, new_city))
 
-        # Update the Driver's address
+        # Now update the driver's address
         cur.execute("""
             UPDATE Driver
             SET nameofroad = %s, number = %s, city = %s
@@ -495,6 +499,7 @@ def update_driver_address():
         """, (new_nameofroad, new_number, new_city, name))
 
         if cur.rowcount == 0:
+            conn.rollback()
             return jsonify({"error": "Driver not found."}), 404
 
         conn.commit()
@@ -666,26 +671,35 @@ def add_credit_card():
     conn = get_connection()
     cur = conn.cursor()
     try:
-        # Address must exist first
+        # Check if address exists
         cur.execute("""
             SELECT * FROM Address WHERE nameofroad = %s AND number = %s AND city = %s
         """, (nameofroad, number, city))
         address = cur.fetchone()
-        if not address:
-            return jsonify({"error": "Address does not exist. Please insert address first."}), 400
 
+        # If not, insert the address
+        if not address:
+            cur.execute("""
+                INSERT INTO Address (nameofroad, number, city)
+                VALUES (%s, %s, %s)
+            """, (nameofroad, number, city))
+
+        # Now insert the credit card linked to the address
         cur.execute("""
             INSERT INTO CreditCard (ccnum, client_email, nameofroad, number, city)
             VALUES (%s, %s, %s, %s, %s)
         """, (ccnum, client_email, nameofroad, number, city))
+
         conn.commit()
-        return jsonify({"message": "Credit card added successfully"})
+        return jsonify({"message": "Credit card added successfully, address linked to the credit card"})
+
     except Exception as e:
         conn.rollback()
         return jsonify({"error": str(e)}), 400
     finally:
         cur.close()
         conn.close()
+
 
 @app.route('/client/login', methods=['POST'])
 def client_login():
@@ -910,5 +924,5 @@ def add_review():
 
 
 if __name__ == '__main__':
-    print("✅ Server is running fine at http://127.0.0.1:5000 🚀")
+    print("✅ Server is running fine at http://127.0.0.1:5050 🚀")
     app.run(debug=True, port=5050)

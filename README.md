@@ -38,3 +38,16 @@ A full-stack web application built using Flask, HTML, JavaScript (with Bootstrap
    ```bash
    git clone https://github.com/DoSomethingGreat07/Online_taxi_rental_service.git
    cd taxi-rental-system
+
+   ## 🚀 How to Run
+
+Open **two terminal windows or tabs**, and run the following commands in the root project directory:
+
+### 1️⃣ Run the frontend server:
+
+```bash
+python3 -m http.server 8000
+
+### Run the Backend server
+
+python3 app.py
